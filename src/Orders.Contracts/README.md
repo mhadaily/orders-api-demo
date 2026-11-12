@@ -6,6 +6,9 @@ This package contains the order summary contract used by the fictional
 `OrderRules.Get(id)` returns an `OrderSummary` for a positive order ID. It
 throws `ArgumentOutOfRangeException` when the ID is zero or negative.
 
+The `orders-api` endpoint returns HTTP 400 for zero or negative IDs before
+calling `OrderRules.Get`.
+
 ```csharp
 using Globomantics.Orders.Contracts;
 
