@@ -1,0 +1,50 @@
+# Entry point bound to the saved pipeline `orders-api-ci`.
+# Both options default to false, so a manual run is build-only: it restores,
+# builds, runs the Orders.Checks console check and publishes the `orders-api-web`
+# artifact. It does not publish a feed package or deploy.
+# Pull request validation for Azure Repos is a branch policy on `main`,
+# not a `pr:` trigger in this file.
+trigger:
+  branches:
+    include:
+    - main
+
+parameters:
+- name: publishPackages
+  type: boolean
+  default: false
+- name: deployStaging
+  type: boolean
+  default: false
+
+stages:
+- template: ci/build-stage.yml
+  parameters:
+    publishPackages: ${{ parameters.publishPackages }}
+
+- ${{ if eq(parameters.deployStaging, true) }}:
+  - stage: Staging
+    displayName: Move orders-api to staging
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+    - deployment: DeployOrders
+      timeoutInMinutes: 15
+      pool:
+        vmImage: ubuntu-24.04
+      environment: staging
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - download: current
+              artifact: orders-api-web
+            # `sc-globomantics-orders-azure` is a PROPOSED service-connection alias,
+            # not a confirmed resource. Module 1 never enables deployStaging.
+            - task: AzureWebApp@1
+              inputs:
+                azureSubscription: sc-globomantics-orders-azure
+                appType: webAppLinux
+                # Illustrative scenario name only; verify the app and runtime before enabling deployStaging. [VERIFY: V01]
+                appName: app-globomantics-orders-stg
+                package: $(Pipeline.Workspace)/orders-api-web

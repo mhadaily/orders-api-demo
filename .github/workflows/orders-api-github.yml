@@ -1,0 +1,201 @@
+# GitHub Actions comparison workflow for Module 4 (Clip 5).
+# Copy to `.github/workflows/orders-api-github.yml` in a repository whose ROOT is the
+# contents of ../module-01-setting-up-traceable-delivery/orders-api/ (see runbook Part 3).
+# It reuses the canonical `ci/build.sh`; there is no second copy of the app.
+#
+# Safe defaults (both optional jobs are explicit opt-ins, off by default):
+#   * manual dispatch only: no push, pull_request or schedule trigger;
+#   * `publishPackages` and `deployStaging` default to false, so a plain dispatch is build-only;
+#   * workflow-level permissions are `contents: read`;
+#   * `packages: write` exists ONLY on `publish-package`; `id-token: write` ONLY on `deploy-staging`;
+#   * every action is pinned to a full commit SHA (the tag it was resolved from is in the
+#     trailing comment; re-resolve before recording) and every job has a timeout;
+#   * no Azure credential is stored here: the deploy job signs in with OIDC using
+#     owner-provided repository/environment VARIABLES (IDs, not secrets).
+#
+# Two identities, never mixed:
+#   * GitHub Packages -> the run's built-in GITHUB_TOKEN, scoped by `packages: write`.
+#   * Azure           -> an Entra identity reached through OIDC. `id-token: write` only lets the
+#                        job REQUEST a token; the federation (trust) and the Azure role on the
+#                        App Service are configured by their owners, and Azure decides what the
+#                        identity may do. This job never receives packages: write.
+#
+# Owner prerequisites for `deploy-staging` (NOT created or asserted by this file):
+#   variables AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, AZURE_WEBAPP_NAME;
+#   a GitHub environment named `staging` (its required reviewers are owner-configured and
+#   plan-dependent); a federated credential matching the repository's actual OIDC subject;
+#   an existing Linux App Service whose runtime matches net10.0 and a role for the identity.
+name: orders-api-github
+
+on:
+  workflow_dispatch:
+    inputs:
+      publishPackages:
+        description: Publish the contracts package to GitHub Packages (opt-in)
+        required: true
+        type: boolean
+        default: false
+      deployStaging:
+        description: Deploy the build to the owner-configured staging App Service (opt-in; main only)
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      package_version: ${{ steps.version.outputs.value }}
+    steps:
+    - name: Checkout reviewed source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Acquire pinned SDK
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        dotnet-version: 10.0.403
+    - name: Compute package version
+      id: version
+      shell: bash
+      # run_number is stable across "Re-run jobs"; run_attempt increments. Using both
+      # keeps every attempt's version unique. Valid SemVer: 1.0.<run_number>-attempt.<n>
+      run: echo "value=1.0.${GITHUB_RUN_NUMBER}-attempt.${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+    - name: Build validate publish and pack
+      shell: bash
+      run: bash ci/build.sh
+      env:
+        PACKAGE_VERSION: ${{ steps.version.outputs.value }}
+        RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        SOURCE_REVISION: ${{ github.sha }}
+        # MSBuild reads this environment variable, so the package links to this
+        # repository without editing the canonical csproj.
+        RepositoryUrl: ${{ github.server_url }}/${{ github.repository }}
+    - name: Record evidence in the run summary
+      shell: bash
+      run: |
+        {
+          echo '### release evidence'
+          echo '```text'
+          cat out/web/release-evidence.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload application handoff
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: orders-api-web
+        path: out/web
+        if-no-files-found: error
+    - name: Upload package for the publish job
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: orders-api-contracts
+        path: out/packages
+        if-no-files-found: error
+
+  publish-package:
+    if: inputs.publishPackages && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - name: Acquire pinned SDK
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        dotnet-version: 10.0.403
+    - name: Download the package built in this run
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: orders-api-contracts
+        path: ${{ runner.temp }}/packages
+    - name: Push to GitHub Packages (a duplicate version is rejected, never skipped)
+      shell: bash
+      run: >-
+        dotnet nuget push
+        "${RUNNER_TEMP}/packages/Globomantics.Orders.Contracts.${PACKAGE_VERSION}.nupkg"
+        --source "https://nuget.pkg.github.com/${GITHUB_REPOSITORY_OWNER}/index.json"
+        --api-key "${NUGET_API_KEY}"
+      env:
+        PACKAGE_VERSION: ${{ needs.build.outputs.package_version }}
+        NUGET_API_KEY: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-staging:
+    # Runs only when opted in, on main, after a successful build, and after a package
+    # push that either succeeded or was not requested (a skipped publish is fine, a failed one is not).
+    if: ${{ !cancelled() && inputs.deployStaging && github.ref == 'refs/heads/main' && needs.build.result == 'success' && (needs.publish-package.result == 'success' || needs.publish-package.result == 'skipped') }}
+    needs: [build, publish-package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: staging
+    # One staging deployment at a time; an active deployment is never cancelled. Caveat: only one
+    # run can wait per group, and a newer pending run replaces an older pending run.
+    concurrency:
+      group: orders-api-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Stop early if an owner-provided variable is missing
+      shell: bash
+      run: |
+        missing=''
+        for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_WEBAPP_NAME; do
+          if [ -z "${!name:-}" ]; then missing="$missing $name"; fi
+        done
+        if [ -n "$missing" ]; then
+          echo "STOP: owner-provided variable(s) not set:$missing. Ask the owner; do not add a secret or edit this file." >&2
+          exit 1
+        fi
+        echo "owner variables present (values not printed); target app variable is set"
+      env:
+        AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+        AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+        AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+    - name: Download the web output built in this run
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: orders-api-web
+        path: ${{ runner.temp }}/orders-api-web
+    - name: Confirm the downloaded output is this run's build
+      shell: bash
+      run: |
+        set -euo pipefail
+        dir="${RUNNER_TEMP}/orders-api-web"
+        test -f "${dir}/Orders.Api.dll"
+        grep -qx "package_version=${PACKAGE_VERSION}" "${dir}/release-evidence.txt"
+        cat "${dir}/release-evidence.txt"
+      env:
+        PACKAGE_VERSION: ${{ needs.build.outputs.package_version }}
+    - name: Sign in to Azure with OIDC (identity comes from the owner's federation)
+      uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+      with:
+        client-id: ${{ vars.AZURE_CLIENT_ID }}
+        tenant-id: ${{ vars.AZURE_TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    - name: Deploy the downloaded folder to the existing staging app
+      id: deploy
+      uses: azure/webapps-deploy@02a81bead70021f5284939794bcec79c271ab383 # v3.0.8
+      with:
+        app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+        slot-name: production
+        package: ${{ runner.temp }}/orders-api-web
+    - name: Record deployment evidence in the run summary
+      shell: bash
+      run: |
+        {
+          echo '### staging deployment'
+          echo "app url: ${WEBAPP_URL}"
+          echo "compare GET /release with the evidence lines in the build job summary"
+        } >> "$GITHUB_STEP_SUMMARY"
+      env:
+        WEBAPP_URL: ${{ steps.deploy.outputs.webapp-url }}
